@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 
 import logging
-import pathlib
-import os
 import rich_click as click
 import sys
 import polars as pl
@@ -105,10 +103,17 @@ def main():
     type=click.Path(exists=True, dir_okay=False),
     help="Path to instanovo ipc file. Necessary to get correct ID",
 )
+@click.option(
+    "--out",
+    required=True,
+    type=click.Path(exists=False, dir_okay=False),
+    help="Path where summary file will be exported to. Needs to be tsv or csv.",
+)
 def summary(
     denovo,
     database_search,
     instanovo_ipc,
+    out
 ):
     """
     Summarize different de novo files into a csv table
@@ -118,13 +123,22 @@ def summary(
     """
     setup_logging("info")
 
+    #TODO CHeck index, scan, etc overlap for PointNovo & Casanovo
+    # mgf- new formatted: TITLE=Run: F06, Index: 83187, Old index: 83186, Old scan: 83186 
+    # mgf: TITLE=controllerType=0 controllerNumber=1 scan=91637
+
     for denovo_file in denovo:
-        print(denovo_file)
         if denovo_file.endswith(".mztab"):
             logger.info(f"Casnovo file detected: {denovo_file}")
             casanovo_df = pl.read_csv(denovo_file, separator="\t", truncate_ragged_lines=True, comment_prefix="MTD")
             casanovo_df = casanovo_df.drop_nulls()
 
+            # Increase Scan ID for 1, since there seems to be a mismatch
+            scan_id = casanovo_df['PSM_ID'].to_list()
+            scan_id = [i + 1 for i in scan_id]
+            casanovo_df = casanovo_df.with_columns(pl.Series(name="PSM_ID", values=scan_id))
+
+            # Modify peptide sequence, uniform modifications, remove all other mods besides m q n
             casanovo_peptide = casanovo_df['sequence'].to_list()
             casanovo_peptide = [str(i).replace('M+15.995', 'm').replace('Q+0.984', 'q').replace('N+0.984', 'n').replace(' ',
                                         '').replace('C+57.021', 'C').replace('+43.006', '').replace('-17.027', '').replace('+42.011','') for i in casanovo_peptide]
@@ -141,18 +155,27 @@ def summary(
             pointnovo_peptide = pointnovo_df['predicted_sequence'].to_list()
             for i in range(len(pointnovo_peptide)):
                 pointnovo_peptide[i] = str(pointnovo_peptide[i])
-                pointnovo_peptide[i] = pointnovo_peptide[i].replace(",", "").replace("I", "L").replace("N(Deamidation)",
+                pointnovo_peptide[i] = pointnovo_peptide[i].replace(",", "").replace("N(Deamidation)",
                 "n").replace("Q(Deamidation)", "q").replace("C(Carbamidomethylation)", "C").replace("M(Oxidation)", "m")
             pointnovo_df = pointnovo_df.with_columns(pl.Series(name="Pointnovo_Peptide", values=pointnovo_peptide)) 
+            
             pointnovo_score = pointnovo_df['predicted_score'].to_list()
             new_score =  [np.exp(i) * 100 for i in pointnovo_score]
             pointnovo_df = pointnovo_df.with_columns(pl.Series(name="Pointnovo_Score", values=new_score)) 
+            
             pointnovo_df = pointnovo_df.select(["feature_id", "Pointnovo_Peptide", "Pointnovo_Score"])
             pointnovo_df = pointnovo_df.rename({"feature_id":"PSM_ID"})
+            
+            # Here again, increase for correct match between scan and PSM_ID from de novo tool
+            scan_id = pointnovo_df['PSM_ID'].to_list()
+            scan_id = [i + 1 for i in scan_id]
+            pointnovo_df = pointnovo_df.with_columns(pl.Series(name="PSM_ID", values=scan_id))
+
+
         elif denovo_file.endswith(".csv"):
             logger.info(f"Instanovo file detected: {denovo_file}")
-            instanovo_df = pl.read_csv(denovo_file, separator=",", truncate_ragged_lines=True).with_row_count(name="PSM_ID")
-            
+            instanovo_df = pl.read_csv(denovo_file, separator=",", truncate_ragged_lines=True).with_row_index(name="PSM_ID")
+            instanovo_df = instanovo_df.drop_nulls()
             instanovo_df = instanovo_df.with_columns(pl.col('PSM_ID').cast(pl.Int64, strict=False).alias('PSM_ID'))
             
             instanovo_df = instanovo_df.rename({"preds":"Instanovo_Peptide", "log_probs":"Instanovo_Score"})
@@ -166,39 +189,53 @@ def summary(
                 logger.warning("Instanovo IPC was not added. Correct ID cannot be detemined. This file will be skipped")
                 continue
             
+            # Again as before increase to get correct match
+            scan_id = instanovo_df['PSM_ID'].to_list()
+            scan_id = [i + 1 for i in scan_id]
+            instanovo_df = instanovo_df.with_columns(pl.Series(name="PSM_ID", values=scan_id))
+
+
+            # Here we use the IPC file to retrieve the original scan ID / index!
             in_ipc = pl.read_ipc(instanovo_ipc)
-            #print(in_ipc)
-            #print(instanovo_df)
-            # TODO We need another parameter for the initial file 
+            in_ipc = in_ipc.select(["scan_number", "scans"])
+            instanovo_df = instanovo_df.join(in_ipc, left_on="PSM_ID", right_on="scan_number", how="inner")
+            instanovo_df = instanovo_df.with_columns([pl.col("scans").alias("PSM_ID")])
+            instanovo_df = instanovo_df.with_columns(pl.col('PSM_ID').cast(pl.Int64, strict=True))
+            instanovo_df = instanovo_df.select(["PSM_ID", "Instanovo_Peptide", "Instanovo_Score"])
         else:
             logger.info(f"File {denovo_file} could not be identified.")
-
-    #with pl.Config(tbl_cols=instanovo_df.width):
-    #    print(instanovo_df)
-
 
     denovo_df = casanovo_df.join(pointnovo_df, left_on="PSM_ID", right_on="PSM_ID", how="outer_coalesce")
     denovo_df = denovo_df.join(instanovo_df, left_on="PSM_ID", right_on="PSM_ID", how="outer_coalesce")
     database_df = pl.read_csv(database_search, separator="\t", truncate_ragged_lines=True)
 
+    # Take the last part for PSM_ID, f.e. xyz564; scan=123, take 123
     psm_id = database_df["PSMId"].to_list()
     psm_id = [int(i.split('scan=', 1)[-1]) for i in psm_id]
     database_df = database_df.with_columns(pl.Series(name="PSMId", values=psm_id)) 
 
     db_peptide = database_df['peptide'].to_list()
+    # Replace Modfications and numbers
     db_peptide = [str(i).replace('[57.02147]', '').replace('M[15.99492]', 'm').replace('.', '')
                   .replace('-', '').replace('[','').replace(']','').replace('X', '')
                    for i in db_peptide]
+    # Remove all other numbers in the peptide sequence for comparison
     db_peptide = [re.sub(r'[0-9]', '', i) for i in db_peptide]
     database_df = database_df.with_columns(pl.Series(name="peptide", values=db_peptide)) 
 
+    # Merge Database and De novo df
     merged_df = database_df.join(denovo_df, left_on="PSMId", right_on="PSM_ID", how="outer_coalesce")
-    # TODO: Export df 
+    merged_df.write_csv(out, separator="\t")
+    logger.info(f"Merged dataframe with de novo sequencing results and database reference was exported to {out}")
 
     evaluation(merged_df)
     logger.info("DONE!")
 
+
 def _match_AA_novor(target, predicted):
+    """
+    This was taken from DeepNovo. How AA Precision and Recall is calculated in their publications. 
+    """
     num_match = 0
     target_len = len(target)
     predicted_len = len(predicted)
@@ -255,7 +292,6 @@ def precision_recall_with_threshold(peptides_truth, peptides_predicted, peptides
         number_peptides += 1
         if (type(predicted_peptide) is str and type(true_peptide) is str and peptides_predicted_confidence[i] >= threshold):
             length_of_predictedAA += len(predicted_peptide)
-            #print(predicted_peptide)
             predicted_AA_id = [vocab[x] for x in predicted_peptide]
             target_AA_id = [vocab[x] for x in true_peptide]
             recall_AA = _match_AA_novor(target_AA_id, predicted_AA_id)
@@ -282,29 +318,10 @@ def evaluation(df):
                 tool_AAprecision.append(str(sum_AAmatches * 100 / length_of_predictedAA))
                 tool_AArecall.append(str(sum_AAmatches * 100 / length_of_realAA))
                 #tool_scorecutoff.append(score_cutoff)
-        print(tool)
-        print(tool_accuracy, tool_AArecall, tool_AAprecision)
-    return 0
-
-
-@main.command()
-@click.argument(
-    "tsv",
-    required=True,
-    type=click.Path(exists=True, dir_okay=False),
-)
-def evaluate(
-    test
-):
-    """
-    Evaluate the different tools by calculating summary stats
-
-    """
-    setup_logging("info")
-    logger.info("DONE!")
-
-
-
+        logger.info(f"Performance for {tool}")
+        logger.info(f"Peptide recall (%): {tool_accuracy[0]}")
+        logger.info(f"AA recall (%): {tool_AArecall[0]}")
+        logger.info(f"AA precision (%): {tool_AAprecision[0]}")
 
 def setup_logging(verbosity):
     logging_levels = {
