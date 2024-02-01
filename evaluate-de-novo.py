@@ -6,6 +6,7 @@ import sys
 import polars as pl
 import numpy as np
 import re
+from pyteomics import mgf
 logger = logging.getLogger("denovo-eval")
 
 _PAD = "_PAD"
@@ -104,6 +105,18 @@ def main():
     help="Path to instanovo ipc file. Necessary to get correct ID",
 )
 @click.option(
+    "--pointnovo_mgf",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to pointnovo mgf. Necessary to get correct ID",
+)
+@click.option(
+    "--mgf_in",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to defeault mgf. Necessary to get correct ID",
+)
+@click.option(
     "--out",
     required=True,
     type=click.Path(exists=False, dir_okay=False),
@@ -113,6 +126,8 @@ def summary(
     denovo,
     database_search,
     instanovo_ipc,
+    pointnovo_mgf,
+    mgf_in,
     out
 ):
     """
@@ -135,7 +150,7 @@ def summary(
 
             # Increase Scan ID for 1, since there seems to be a mismatch
             scan_id = casanovo_df['PSM_ID'].to_list()
-            scan_id = [i + 1 for i in scan_id]
+            #scan_id = [i + 1 for i in scan_id]
             casanovo_df = casanovo_df.with_columns(pl.Series(name="PSM_ID", values=scan_id))
 
             # Modify peptide sequence, uniform modifications, remove all other mods besides m q n
@@ -148,6 +163,9 @@ def summary(
             casanovo_df = casanovo_df.with_columns(pl.Series(name="Casanovo_Score", values=new_score)) 
 
             casanovo_df = casanovo_df.select(["PSM_ID", "Casanovo_Peptide", "Casanovo_Score"])
+
+            print(casanovo_df)
+            exit()
         elif denovo_file.endswith(".deepnovo_denovo"):
             logger.info(f"Pointnovo file detected: {denovo_file}")
             pointnovo_df = pl.read_csv(denovo_file, separator="\t", truncate_ragged_lines=True)
@@ -158,19 +176,28 @@ def summary(
                 pointnovo_peptide[i] = pointnovo_peptide[i].replace(",", "").replace("N(Deamidation)",
                 "n").replace("Q(Deamidation)", "q").replace("C(Carbamidomethylation)", "C").replace("M(Oxidation)", "m")
             pointnovo_df = pointnovo_df.with_columns(pl.Series(name="Pointnovo_Peptide", values=pointnovo_peptide)) 
-            
+
             pointnovo_score = pointnovo_df['predicted_score'].to_list()
             new_score =  [np.exp(i) * 100 for i in pointnovo_score]
             pointnovo_df = pointnovo_df.with_columns(pl.Series(name="Pointnovo_Score", values=new_score)) 
             
             pointnovo_df = pointnovo_df.select(["feature_id", "Pointnovo_Peptide", "Pointnovo_Score"])
             pointnovo_df = pointnovo_df.rename({"feature_id":"PSM_ID"})
-            
-            # Here again, increase for correct match between scan and PSM_ID from de novo tool
-            scan_id = pointnovo_df['PSM_ID'].to_list()
-            scan_id = [i + 1 for i in scan_id]
-            pointnovo_df = pointnovo_df.with_columns(pl.Series(name="PSM_ID", values=scan_id))
 
+            # This is necessary because I used a reformatted file for de novo predicitng for de novo
+            # To infer the original we need to compare both mgf files since the pointnovo_mgf has been reindexed
+            # This part can be removed in case we use the same mgf file for Pointnovo and the other tools
+            reader_pointnovo_mgf = mgf.read(pointnovo_mgf)
+            reader_mgf = mgf.read(mgf_in)
+            scan_pointnovo = [int(i['params']['scans']) for i in reader_pointnovo_mgf]
+            scan_mgf = [int(i['params']['scans']) for i in reader_mgf]
+
+            scan_df = pl.DataFrame({"scan_ID_pointnovo": scan_pointnovo, "scan_ID_mgf": scan_mgf})
+            # Here again, increase for correct match between scan and PSM_ID from de novo tool
+            
+            pointnovo_df = pointnovo_df.join(scan_df, left_on="PSM_ID", right_on="scan_ID_pointnovo", how="outer_coalesce")
+            pointnovo_df = pointnovo_df.with_columns([pl.col("scan_ID_mgf").cast(pl.Int64, strict=False).alias("PSM_ID")])
+            # TODO Filter
 
         elif denovo_file.endswith(".csv"):
             logger.info(f"Instanovo file detected: {denovo_file}")
@@ -214,13 +241,17 @@ def summary(
     psm_id = [int(i.split('scan=', 1)[-1]) for i in psm_id]
     database_df = database_df.with_columns(pl.Series(name="PSMId", values=psm_id)) 
 
+    
+
     db_peptide = database_df['peptide'].to_list()
     # Replace Modfications and numbers
     db_peptide = [str(i).replace('[57.02147]', '').replace('M[15.99492]', 'm').replace('.', '')
-                  .replace('-', '').replace('[','').replace(']','').replace('X', '')
+                  .replace('-', '').replace('[','').replace(']','').replace('X', '')[1:-1]
                    for i in db_peptide]
     # Remove all other numbers in the peptide sequence for comparison
-    db_peptide = [re.sub(r'[0-9]', '', i) for i in db_peptide]
+    db_peptide = [re.sub(r'[0-9]', '', i) for i in db_peptide] 
+    # TODO Instead of just removing the numbers in the peptide seq, we should remove all rows containing this kind of modifications
+    # TODO Also remove rows containing - symbols
     database_df = database_df.with_columns(pl.Series(name="peptide", values=db_peptide)) 
 
     # Merge Database and De novo df
