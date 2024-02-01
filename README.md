@@ -3,7 +3,7 @@ Script for comparing multiple de novo tools
 
 ## Example command
 
-python evaluate-de-novo.py summary --database_search ../XTandem-MS2Rescore/F06.pout ../Casanovo/F06.mztab ../PointNovo/F06_features.csv.deepnovo_denovo ../InstaNovo/Base-model\(instanovo.pt\)/F06.csv --instanovo_ipc ../../analysis-2023/001-Datasets/F06/F06.ipc --out ../F06-summary.tsv
+python evaluate-de-novo.py summary --database_search ../XTandem-MS2Rescore/S07.pout ../Casanovo/S07.mztab ../PointNovo/S07_features.csv.deepnovo_denovo ../InstaNovo/Base-model_instanovo_pt/S07.csv --instanovo_ipc ../../analysis-2023/001-Datasets/S07/S07.ipc --out ../S07-summary.tsv --pointnovo_mgf ../../analysis-2023/001-Datasets/S07/S07_msconvert_reformatted_deepnovo.mgf --mgf_in ../../analysis-2023/001-Datasets/S07/S07.mgf
 
 ## Example output
 Currently it outputs all results without using any thresholding approach.

@@ -159,7 +159,7 @@ def summary(
             
             # get the number of total scans in the dataset
             last_scan = int(scan_id[-1])
-            new_scan_list = range(1, last_scan + 1)
+            new_scan_list = range(1, len(scan_mgf) + 1)
             scan_df = pl.DataFrame({"scan_ID_mgf": scan_mgf, "scan_ID_casanovo": new_scan_list})
 
 
@@ -232,10 +232,17 @@ def summary(
             # Here we use the IPC file to retrieve the original scan ID / index!
             in_ipc = pl.read_ipc(instanovo_ipc)
             in_ipc = in_ipc.select(["scan_number", "scans"])
+            scan_number = range(1, len(in_ipc) + 1)
+            in_ipc = in_ipc.with_columns(pl.Series(name="scan_number", values=scan_number)) 
+
             instanovo_df = instanovo_df.join(in_ipc, left_on="PSM_ID", right_on="scan_number", how="inner")
+
             instanovo_df = instanovo_df.with_columns([pl.col("scans").alias("PSM_ID")])
+
             instanovo_df = instanovo_df.with_columns(pl.col('PSM_ID').cast(pl.Int64, strict=True))
+
             instanovo_df = instanovo_df.select(["PSM_ID", "Instanovo_Peptide", "Instanovo_Score"])
+
         else:
             logger.info(f"File {denovo_file} could not be identified.")
 
