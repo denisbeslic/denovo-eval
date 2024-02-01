@@ -138,34 +138,45 @@ def summary(
     """
     setup_logging("info")
 
-    #TODO CHeck index, scan, etc overlap for PointNovo & Casanovo
-    # mgf- new formatted: TITLE=Run: F06, Index: 83187, Old index: 83186, Old scan: 83186 
-    # mgf: TITLE=controllerType=0 controllerNumber=1 scan=91637
+    # read the mgf file and extract the scan IDs
+    reader_pointnovo_mgf = mgf.read(pointnovo_mgf)
+    reader_mgf = mgf.read(mgf_in)
+    scan_pointnovo = [int(i['params']['scans']) for i in reader_pointnovo_mgf]
+    scan_mgf = [int(i['params']['scans']) for i in reader_mgf]
 
     for denovo_file in denovo:
         if denovo_file.endswith(".mztab"):
             logger.info(f"Casnovo file detected: {denovo_file}")
             casanovo_df = pl.read_csv(denovo_file, separator="\t", truncate_ragged_lines=True, comment_prefix="MTD")
-            casanovo_df = casanovo_df.drop_nulls()
 
-            # Increase Scan ID for 1, since there seems to be a mismatch
-            scan_id = casanovo_df['PSM_ID'].to_list()
-            #scan_id = [i + 1 for i in scan_id]
+            # This is necessary because Casanovo re-indexes the mgf file
+            # index and scan will start at 0 which is not common to the original mgf file
+
+            # Replace PSM_ID by spectra_refs scan_id to get correct matching
+            scan_id = casanovo_df['spectra_ref'].to_list()
+            scan_id = [int(i.split("index=")[-1])+1 for i in scan_id]
             casanovo_df = casanovo_df.with_columns(pl.Series(name="PSM_ID", values=scan_id))
+            
+            # get the number of total scans in the dataset
+            last_scan = int(scan_id[-1])
+            new_scan_list = range(1, last_scan + 1)
+            scan_df = pl.DataFrame({"scan_ID_mgf": scan_mgf, "scan_ID_casanovo": new_scan_list})
+
+
+            casanovo_df = casanovo_df.join(scan_df, left_on="PSM_ID", right_on="scan_ID_casanovo", how="outer_coalesce")
+            casanovo_df = casanovo_df.with_columns([pl.col("scan_ID_mgf").cast(pl.Int64, strict=False).alias("PSM_ID")])
 
             # Modify peptide sequence, uniform modifications, remove all other mods besides m q n
             casanovo_peptide = casanovo_df['sequence'].to_list()
             casanovo_peptide = [str(i).replace('M+15.995', 'm').replace('Q+0.984', 'q').replace('N+0.984', 'n').replace(' ',
                                         '').replace('C+57.021', 'C').replace('+43.006', '').replace('-17.027', '').replace('+42.011','') for i in casanovo_peptide]
             casanovo_df = casanovo_df.with_columns(pl.Series(name="Casanovo_Peptide", values=casanovo_peptide)) 
+            casanovo_df = casanovo_df.drop_nulls()
 
             new_score = [i * 100 for i in casanovo_df['search_engine_score[1]'].to_list()]
             casanovo_df = casanovo_df.with_columns(pl.Series(name="Casanovo_Score", values=new_score)) 
 
             casanovo_df = casanovo_df.select(["PSM_ID", "Casanovo_Peptide", "Casanovo_Score"])
-
-            print(casanovo_df)
-            exit()
         elif denovo_file.endswith(".deepnovo_denovo"):
             logger.info(f"Pointnovo file detected: {denovo_file}")
             pointnovo_df = pl.read_csv(denovo_file, separator="\t", truncate_ragged_lines=True)
@@ -187,10 +198,6 @@ def summary(
             # This is necessary because I used a reformatted file for de novo predicitng for de novo
             # To infer the original we need to compare both mgf files since the pointnovo_mgf has been reindexed
             # This part can be removed in case we use the same mgf file for Pointnovo and the other tools
-            reader_pointnovo_mgf = mgf.read(pointnovo_mgf)
-            reader_mgf = mgf.read(mgf_in)
-            scan_pointnovo = [int(i['params']['scans']) for i in reader_pointnovo_mgf]
-            scan_mgf = [int(i['params']['scans']) for i in reader_mgf]
 
             scan_df = pl.DataFrame({"scan_ID_pointnovo": scan_pointnovo, "scan_ID_mgf": scan_mgf})
             # Here again, increase for correct match between scan and PSM_ID from de novo tool
@@ -259,7 +266,7 @@ def summary(
     merged_df.write_csv(out, separator="\t")
     logger.info(f"Merged dataframe with de novo sequencing results and database reference was exported to {out}")
 
-    evaluation(merged_df)
+    evaluation(merged_df, out)
     logger.info("DONE!")
 
 
@@ -333,9 +340,13 @@ def precision_recall_with_threshold(peptides_truth, peptides_predicted, peptides
             sum_AAmatches += 0
     return length_of_predictedAA, length_of_realAA, number_peptides, sum_peptidematch, sum_AAmatches
 
-def evaluation(df):
+def evaluation(df, out):
     df = df.filter(~pl.all_horizontal(pl.col('score').is_null()))
-    for tool in ["Casanovo", "Pointnovo", "Instanovo"]:
+    recall = []
+    AA_recall = []
+    AA_prec = []
+    tool_list = ["Casanovo", "Pointnovo", "Instanovo"]
+    for tool in tool_list:
         tool_AArecall = []
         tool_accuracy = []
         tool_AAprecision = []
@@ -353,6 +364,13 @@ def evaluation(df):
         logger.info(f"Peptide recall (%): {tool_accuracy[0]}")
         logger.info(f"AA recall (%): {tool_AArecall[0]}")
         logger.info(f"AA precision (%): {tool_AAprecision[0]}")
+        recall.append(tool_accuracy[0])
+        AA_recall.append(tool_AArecall[0])
+        AA_prec.append(tool_AAprecision[0])
+    
+    eval_df = pl.DataFrame({"tools": tool_list, "peptide_recall": recall, "AA_recall": AA_recall, "AA_precision": AA_prec})
+    out = out.replace(".tsv", "-stats.tsv")
+    eval_df.write_csv(out, separator="\t")
 
 def setup_logging(verbosity):
     logging_levels = {
